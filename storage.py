@@ -69,6 +69,38 @@ def create_submission(submission_id, creator_id, text, llm_score, stylo_score, s
         )
 
 
+def get_submission(submission_id):
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM submissions WHERE submission_id = ?",
+            (submission_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def file_appeal(submission_id, creator_id, reasoning, original_decision):
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE submissions SET status = ? WHERE submission_id = ?",
+            ("under_review", submission_id),
+        )
+        conn.execute(
+            "INSERT INTO audit_log (submission_id, event, details, timestamp) VALUES (?, ?, ?, ?)",
+            (
+                submission_id,
+                "appeal_filed",
+                json.dumps({
+                    "creator_id": creator_id,
+                    "appeal_reasoning": reasoning,
+                    "status": "under_review",
+                    "original_decision": original_decision,
+                }),
+                now,
+            ),
+        )
+
+
 def get_log(limit=20):
     with _connect() as conn:
         rows = conn.execute(
