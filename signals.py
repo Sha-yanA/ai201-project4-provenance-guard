@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import statistics
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -33,3 +35,134 @@ def classify_with_llm(text):
     parsed = json.loads(content)
     score = float(parsed["llm_score"])
     return max(0.0, min(1.0, score))
+
+
+def _split_sentences(text):
+    sentences = re.split(r"[.!?]+(?:\s|$)", text.strip())
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _split_words(text):
+    return re.findall(r"[A-Za-z']+", text.lower())
+
+
+def _clamp(value):
+    return max(0.0, min(1.0, value))
+
+
+# Reference ranges below are rough, documented heuristics (not statistically
+# derived), consistent with the blind spots called out in planning.md section 2:
+# AI-generated text tends toward more *uniform* sentence lengths and more
+# "average" vocabulary and punctuation choices; human writing tends to vary more.
+
+# Typical human sentence-length variance (in words^2) observed in casual prose.
+# Low variance (uniform sentences) reads as more AI-like. Raised from an
+# initial guess of 30 to 50 after Milestone 4 testing showed real samples
+# (both AI and human) landing in the 22-45 range, which saturated the old
+# reference to 0 for nearly every sample and contributed no signal.
+_SENTENCE_VARIANCE_REFERENCE = 50.0
+
+# Type-token ratio (unique words / total words) below this reads as more
+# AI-like (repetitive, "average" vocabulary); above it reads as more human.
+# TTR saturates near 1.0 for almost any coherent text under ~60 words
+# (confirmed empirically during Milestone 4 testing: it was ~0.86-0.90 across
+# both AI and human samples at conversational paragraph length), so it's only
+# treated as informative above this word count; below it, it's excluded from
+# the average rather than averaged in as noise.
+_TTR_REFERENCE = 0.55
+_TTR_MIN_WORDS = 60
+
+# Idiosyncratic punctuation (!, ;, ..., em/en dash, ?) as a share of all
+# punctuation. Low idiosyncrasy (mostly plain commas/periods) reads as AI-like.
+_IDIOSYNCRATIC_PUNCTUATION = set("!;—–?")
+
+# Average word length (characters), scaled linearly between a casual-writing
+# floor and a formal/essay-style ceiling: longer average words read as more
+# AI-like. Originally implemented as "closeness to a neutral average" (4.7),
+# but Milestone 4 testing showed that assumption was backwards: it scored a
+# casual human sample (short words, close to that average) as AI-like, and a
+# formal AI essay sample (long words, far from the average) as human-like,
+# inverted on the two clearest test cases. Replaced with a direct scale
+# grounded in the observed word lengths (casual human ~4.2, formal AI essay
+# ~6.2) instead of an assumed constant.
+_WORD_LENGTH_FLOOR = 4.0
+_WORD_LENGTH_CEILING = 6.5
+
+
+def score_stylometry(text):
+    sentences = _split_sentences(text)
+    words = _split_words(text)
+
+    if len(sentences) < 2 or len(words) < 8:
+        # Not enough structure for these heuristics to mean anything; report
+        # a neutral score rather than noise (see planning.md Anticipated edge
+        # case 2, very short submissions).
+        return 0.5
+
+    sentence_lengths = [len(_split_words(s)) for s in sentences]
+    variance = statistics.pvariance(sentence_lengths)
+    variance_score = _clamp(1 - variance / _SENTENCE_VARIANCE_REFERENCE)
+
+    punctuation = [c for c in text if c in ".,;:!?—–"]
+    if punctuation:
+        idiosyncratic_ratio = sum(1 for c in punctuation if c in _IDIOSYNCRATIC_PUNCTUATION) / len(punctuation)
+    else:
+        idiosyncratic_ratio = 0.0
+    punctuation_score = _clamp(1 - idiosyncratic_ratio)
+
+    avg_word_length = sum(len(w) for w in words) / len(words)
+    complexity_score = _clamp(
+        (avg_word_length - _WORD_LENGTH_FLOOR) / (_WORD_LENGTH_CEILING - _WORD_LENGTH_FLOOR)
+    )
+
+    sub_scores = [variance_score, punctuation_score, complexity_score]
+    if len(words) >= _TTR_MIN_WORDS:
+        ttr = len(set(words)) / len(words)
+        sub_scores.append(_clamp(1 - ttr / _TTR_REFERENCE))
+
+    return statistics.mean(sub_scores)
+
+
+# Signal 3: density of phrases widely documented as overused LLM "tells",
+# independent of formality/register. Compiled from general AI-writing-
+# detection discussion, not reverse-engineered from this project's test
+# samples, to avoid overfitting to them. Known blind spot, confirmed during
+# testing: human writers who genuinely use corporate buzzwords ("leverage",
+# "utilize", "seamless", "robust", "comprehensive") trigger this signal just
+# as strongly as AI-generated text does; this isn't fixable by curating the
+# word list further, since those words really are common in human corporate
+# writing too (see planning.md Anticipated edge cases).
+_STOCK_AI_PHRASES = [
+    "it is important to note", "it's important to note", "it is worth noting",
+    "delve into", "in today's fast-paced world", "in today's digital age",
+    "furthermore", "moreover", "in conclusion", "in summary", "as a result",
+    "plays a crucial role", "plays a vital role", "significant role",
+    "in the realm of", "the tapestry of", "underscore the importance",
+    "shed light on", "navigate the complexities", "holistic approach",
+    "at the end of the day", "unlock the potential", "game changer",
+    "cutting-edge", "leverage", "utilize", "comprehensive", "multifaceted",
+    "paradigm shift", "foster a", "on the other hand", "it is essential to",
+    "seamless", "robust", "boasts",
+]
+
+# Reference density (matches per 100 words) at which this signal saturates to
+# a full AI-like score. Not tuned against this project's test samples.
+_STOCK_PHRASE_REFERENCE_DENSITY = 3.0
+
+
+def score_stock_phrases(text):
+    words = _split_words(text)
+    if len(words) < 8:
+        return 0.5
+
+    lowered = text.lower()
+    match_count = sum(lowered.count(phrase) for phrase in _STOCK_AI_PHRASES)
+    if match_count == 0:
+        # Presence of these phrases is real evidence of AI phrasing; their
+        # absence is not, by itself, strong evidence of a human author (a
+        # test sample confirmed this: an AI-generated casual post with no
+        # stock phrases was wrongly pulled toward "human" when 0 matches
+        # scored as confident human-like). Report neutral instead of 0.0.
+        return 0.5
+    density = match_count / (len(words) / 100)
+    return _clamp(0.5 + 0.5 * min(density / _STOCK_PHRASE_REFERENCE_DENSITY, 1.0))

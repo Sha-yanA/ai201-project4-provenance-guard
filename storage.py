@@ -19,6 +19,8 @@ def init_db():
                 creator_id TEXT NOT NULL,
                 text TEXT NOT NULL,
                 llm_score REAL NOT NULL,
+                stylo_score REAL NOT NULL,
+                stock_score REAL NOT NULL,
                 confidence REAL NOT NULL,
                 label TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -40,14 +42,14 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def create_submission(submission_id, creator_id, text, llm_score, confidence, label):
+def create_submission(submission_id, creator_id, text, llm_score, stylo_score, stock_score, confidence, label):
     now = _now()
     with _connect() as conn:
         conn.execute(
             "INSERT INTO submissions "
-            "(submission_id, creator_id, text, llm_score, confidence, label, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (submission_id, creator_id, text, llm_score, confidence, label, "classified", now),
+            "(submission_id, creator_id, text, llm_score, stylo_score, stock_score, confidence, label, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (submission_id, creator_id, text, llm_score, stylo_score, stock_score, confidence, label, "classified", now),
         )
         conn.execute(
             "INSERT INTO audit_log (submission_id, event, details, timestamp) VALUES (?, ?, ?, ?)",
@@ -57,6 +59,8 @@ def create_submission(submission_id, creator_id, text, llm_score, confidence, la
                 json.dumps({
                     "creator_id": creator_id,
                     "llm_score": llm_score,
+                    "stylo_score": stylo_score,
+                    "stock_score": stock_score,
                     "confidence": confidence,
                     "label": label,
                 }),

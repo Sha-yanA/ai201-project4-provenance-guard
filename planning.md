@@ -75,9 +75,37 @@ with their `submission_id` and reasoning text. This:
   varied sentence length") can easily fall on the wrong side. It's a weak signal alone,
   and it's unreliable on very short text (see Anticipated edge cases).
 
-These two signals are genuinely independent: one is semantic/holistic (LLM), the other
-is structural/statistical (stylometry). When they agree, confidence is well earned;
-when they disagree, that disagreement itself is informative (see confidence scoring).
+**Signal 3 (stretch, ensemble detection): stock AI-phrase density (pure Python)**
+- *What it measures:* density of phrases widely documented as overused LLM "tells"
+  ("it is important to note," "furthermore," "delve into," "leverage," "seamless,"
+  etc.), counted per 100 words. Compiled from general AI-writing-detection discussion,
+  not reverse-engineered from this project's own test samples.
+- *Why it differs between human/AI:* unlike Signal 2, this doesn't measure formality
+  or structure, it measures specific overused phrasing, so it can catch (or fail to
+  catch) cases independently of whether the text is formal or casual.
+- *Output shape:* a float in `[0,1]`. Presence of these phrases is treated as real
+  evidence of AI-like phrasing and scales the score up toward 1; *absence* of matches
+  returns a neutral `0.5` rather than `0.0`, since not using stock phrases is not, by
+  itself, strong evidence of a human author (an AI sample written in a deliberately
+  casual style was wrongly pulled toward "human" during testing when 0 matches scored
+  as confidently human-like; scoring absence as neutral fixed that without introducing
+  new errors, confirmed on a 15-sample held-out test set built after the initial
+  design, not used to tune the lexicon or thresholds).
+- *Blind spot:* it's a keyword list, trivially evaded by avoiding those exact phrases,
+  and it actively backfires on genuine human corporate/marketing writing, which uses
+  the same buzzwords ("leverage," "utilize," "robust," "seamless," "comprehensive")
+  unironically. Confirmed during testing: a human-written corporate-style paragraph
+  was misclassified as AI by this signal alongside the other two, not fixed by adding
+  it (see Anticipated edge cases).
+
+Signals 1 and 2 are genuinely independent: one is semantic/holistic (LLM), the other
+is structural/statistical (stylometry). Signal 3 adds a third, lexical-pattern axis.
+When signals agree, confidence is well earned; when they disagree, that disagreement
+itself is informative (see confidence scoring). Adding Signal 3 was validated on a
+15-sample test set (4 initial + 2 held-out + 9 new, spanning casual/formal/adversarial
+human and AI text) before being wired in: it reduced confidently-wrong labels from
+6/15 to 4/15 with no new regressions, but did not fully solve the formal-writing/
+corporate-buzzword blind spot shared by all three signals (see Anticipated edge cases).
 
 ### 3. Confidence scoring approach
 
@@ -88,23 +116,61 @@ bands it falls into, not its precise value. A `0.51` and a `0.95` must produce v
 different labels; a `0.51` should read as "essentially a coin flip," not "likely AI."
 
 ```
-combined = 0.6 * llm_score + 0.4 * stylo_score
-disagreement = |llm_score - stylo_score|
+combined = 0.5 * llm_score + 0.3 * stylo_score + 0.2 * stock_score
+disagreement = max(llm_score, stylo_score, stock_score) - min(llm_score, stylo_score, stock_score)
 
-if disagreement > 0.35:
-    label = "uncertain"   # signals conflict: don't let either one alone push
+if disagreement > 0.40:
+    label = "uncertain"   # signals conflict: don't let any one of them alone push
                           # to a confident verdict, regardless of where combined lands
 else:
     label = label_from_thresholds(combined)   # see table below
 ```
 
+Weights favor Signal 1 (0.5) as the most holistic check, with Signal 2 (0.3) and
+Signal 3 (0.2) as structural/lexical moderators; disagreement is measured as the
+full range across all three rather than a pairwise difference, so any one signal
+diverging sharply from the other two is still enough to force "uncertain."
+
+**Tuning methodology and results:** the weights, disagreement threshold, and label
+thresholds were calibrated against a 17-sample labeled test set (`tests/eval_samples.py`:
+7 AI, 10 human, spanning casual/formal/academic/corporate/adversarial text), evaluated
+with `tests/eval_weights.py`. Starting point (0.5/0.3/0.2 weights, disagree=0.35,
+AI>=0.70): 6 confidently correct, 4 confidently wrong (all human academic/legal/
+corporate writing misclassified as AI), 7 uncertain. Two changes were validated by
+comparing multiple configurations on this set, not by tuning a single knob in
+isolation:
+- Raising `AI_THRESHOLD` from 0.70 to 0.75 cut wrong labels from 4 to 1 with *no*
+  loss in correct labels, since several genuine human samples landed at 0.72-0.75,
+  just above the old bar. Alternatives tried and rejected: trusting Signal 1 more
+  (0.65/0.2/0.15 weights) increased wrong labels to 6; loosening the disagreement
+  threshold to 0.45 increased wrong labels to 5; equal-thirds weights with a
+  tighter 0.25 disagreement threshold matched the 1-wrong result but at the cost
+  of 2 fewer correct labels (over-cautious).
+- Raising `DISAGREEMENT_THRESHOLD` from 0.35 to 0.40 (found via a grid search over
+  both thresholds) recovered one more correct label with no new errors, by fixing
+  a real interaction: `score_stock_phrases` returns a neutral `0.5` when it finds
+  no stock phrases (deliberate design, see section 2), and at 0.35 that neutral
+  abstention alone was enough to trigger the disagreement override even when the
+  other two signals strongly agreed, incorrectly forcing "uncertain" on otherwise-
+  clear AI samples.
+
+Final result: 7 confidently correct, 1 confidently wrong, 9 uncertain. The one
+remaining wrong case (`human_corporate_buzzword`) is not a tuning gap: its combined
+score (0.86) is statistically indistinguishable from genuine AI samples in the same
+test set (0.88-0.90), so no single threshold can separate it without also excluding
+true positives. This is the same structural limitation as edge case 4/5 below, not
+something a fourth grid search would fix. Because tuning was done against this same
+17-sample set, these values are a validated starting calibration, not a final
+answer, a larger, independently-collected dataset would be needed before trusting
+them in a real deployment (see Open questions).
+
 Label thresholds (asymmetric, biased against false AI accusations per the hint that a
 false positive, human mislabeled as AI, is worse than a false negative), applied only
-when the signals agree (disagreement <= 0.35):
+when the signals agree (disagreement <= 0.40):
 
 | combined score | label               | meaning to a reader |
 |-----------------|---------------------|----------------------|
-| >= 0.70         | high-confidence AI  | "likely AI-generated" |
+| >= 0.75         | high-confidence AI  | "likely AI-generated" |
 | <= 0.30         | high-confidence human | "likely human-written" |
 | otherwise       | uncertain           | "we can't confidently tell" |
 
@@ -124,6 +190,13 @@ known-AI text samples (see AI Tool Plan, M3/M4 verification steps) and confirm s
 separate the two groups rather than clustering near 0.5 regardless of input.
 
 ### 4. False-positive trace (human misclassified as AI)
+
+*Note: this trace was written in Milestone 1, before Signal 3 was added and before
+the section 3 thresholds were tuned in Milestone 4. The numbers below use the
+original 2-signal formula and are kept as-is since they still correctly illustrate
+the design intent; they are no longer the literal formula in production (see
+section 3 for the current values and two now-confirmed real false-positive cases,
+Anticipated edge cases 4 and 5).*
 
 Scenario: a human writer submits a tightly-edited, very uniform blog post. The LLM
 signal is uncertain (0.55, mildly polished but plausible either way) but the
@@ -152,7 +225,7 @@ positives are the worse failure.
 
 **`POST /submit`**
 - Accepts: `{ "text": string, "creator_id": string }`
-- Returns: `{ "submission_id": string, "label": string, "confidence": float, "signals": { "llm_score": float, "stylo_score": float }, "status": "classified" }`
+- Returns: `{ "submission_id": string, "label": string, "confidence": float, "signals": { "llm_score": float, "stylo_score": float, "stock_score": float }, "status": "classified" }`
 - Rate-limited per creator/IP.
 
 **`POST /appeal`**
@@ -299,6 +372,35 @@ Specific content types the system will likely handle poorly:
    fallback exists for; stylometric variety (even simple sentences can vary in length
    and structure) can pull the combined verdict back from a confident AI label.
 
+4. **Formal/academic writing, confirmed during Milestone 4 testing (not just
+   predicted).** A genuine human academic paragraph on monetary policy was
+   misclassified as "high-confidence AI." Unlike edge cases 1-3, the disagreement
+   safety net does not help here, because both signals are fooled in the *same*
+   direction: the LLM signal reads formal register as AI-like, and every
+   stylometric sub-metric we tried (sentence-length variance, punctuation
+   plainness, word length) also correlates with formality rather than
+   authorship, so it doesn't act as an independent check for this case. Two
+   mitigations were tried and rejected: dropping the word-length sub-metric
+   didn't change the outcome (the remaining metrics are equally confounded by
+   formality), and raising the "high-confidence AI" threshold only separated
+   this case from a true positive by a 0.018 margin, too thin to be a robust
+   general threshold rather than an overfit to one example. This is a real,
+   unresolved blind spot, not a bug: distinguishing formal human writing from
+   formal AI writing via structure alone is a known, hard, unsolved problem.
+   The appeals workflow is the actual safety net for this failure mode, not
+   further signal tuning.
+
+5. **Human corporate/marketing writing that genuinely uses buzzwords** ("leverage,"
+   "utilize," "seamless," "robust," "comprehensive"), confirmed while testing the
+   Signal 3 addition. This is the same shape of problem as edge case 4 (a register
+   that both humans and AI produce in a way none of our signals can tell apart), just
+   surfacing through vocabulary instead of sentence structure: Signal 3 was added
+   specifically to catch AI "tells" independent of formality, but it can't distinguish
+   an AI generating buzzword-heavy copy from a human who writes that way natively,
+   since the phrases themselves are genuinely common in real corporate writing. Not
+   fixable by curating the phrase list further. Same mitigation as edge case 4: this
+   is a real limitation to disclose, not a bug to chase, with appeals as the backstop.
+
 ## AI Tool Plan
 
 **M3 (submission endpoint + first signal):**
@@ -352,8 +454,10 @@ least 3 audit log entries visible overall.
 - Fallback behavior when the Groq API call fails or times out: fail the whole request
   (503) vs. fail open to stylometry-only scoring with the label forced to "uncertain"
   (leaning toward the latter, consistent with the "uncertain is safe" design).
-- The combine weights (`0.6`/`0.4`) and label thresholds (`0.70`/`0.30`/`0.35`
-  disagreement) in section 3 are initial guesses, not calibrated values. They need to
-  be checked against real known-AI/known-human/edge-case samples once Signal 1 and
-  Signal 2 are implemented (see AI Tool Plan, M4 verification step), and adjusted if
-  scores don't separate the way this document currently assumes.
+- The combine weights (`0.5`/`0.3`/`0.2`) and label thresholds (`0.75`/`0.30`/`0.40`
+  disagreement) in section 3 have been calibrated against real signal outputs (see
+  section 3's tuning methodology), not left as initial guesses, but only against a
+  17-sample hand-built test set. A larger, independently-collected labeled dataset
+  would be needed before trusting these exact values in a real deployment, and the
+  one confirmed unfixable case (corporate buzzword human writing, edge case 5) should
+  be re-verified rather than assumed permanent as the system evolves.
